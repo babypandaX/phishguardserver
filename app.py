@@ -25,7 +25,7 @@ config = {
     "port": int(os.environ.get("PORT", 5000)),
     "debug": os.environ.get("DEBUG", "false").lower() == "true",
     "user_agent": os.environ.get("USER_AGENT", "PhishGuard/2.0"),
-    "google_api_key": os.environ.get("GOOGLE_API_KEY", ""),
+    "google_api_key": os.environ.get("AIzaSyA5nF2eOEhYvY-GCnHuk4jjPv1LcrwC3J8", ""),
     "risk_threshold": int(os.environ.get("RISK_THRESHOLD", 80)),
     "log_level": os.environ.get("LOG_LEVEL", "INFO")
 }
@@ -34,7 +34,7 @@ config = {
 logging.getLogger('urllib3').setLevel(logging.CRITICAL)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/check": {"origins": "*"}})
 executor = ThreadPoolExecutor(max_workers=8)
 
 # Load brand database
@@ -104,6 +104,7 @@ def check_ssl(url):
             allow_redirects=True,
             stream=False
         )
+        logging.info(f"SSL Valid: {ssl_result['valid']}, Error: {ssl_result.get('error_type')}")
         return {'valid': True, 'error_type': None}
     except Exception as e:
         return {'valid': False, 'error_type': str(e)}
@@ -135,7 +136,7 @@ def get_certificate_info(domain):
                     is_ev = any(policy.policy_identifier in EV_OIDS for policy in ext)
                 except cryptography.x509.ExtensionNotFound:
                     pass
-                
+               
                 return {'organization': org, 'is_ev': is_ev}
     except Exception as e:
         return {'organization': None, 'is_ev': False}
@@ -156,7 +157,7 @@ def check_domain_age(domain):
             
         if not isinstance(created, datetime):
             return {'age': None, 'exists': True}
-            
+        logging.info(f"Domain age: {domain_data['age']} days, Exists: {domain_data['exists']}")   
         return {
             'age': (datetime.now() - created).days,
             'exists': True
@@ -182,6 +183,7 @@ def check_safe_browsing(url):
             },
             timeout=8
         )
+        logging.info(f"Safe Browsing Match: {safe_browsing_match}")
         return bool(response.json().get('matches')) if response.status_code == 200 else False
     except Exception as e:
         return False
@@ -189,6 +191,7 @@ def check_safe_browsing(url):
 def analyze_url(url):
     """Main analysis function"""
     try:
+        logging.info(f"Analyzing URL: {url}")
         parsed = tldextract.extract(url)
         full_domain = f"{parsed.domain}.{parsed.suffix}"
         risk_score = 0
@@ -234,8 +237,8 @@ def analyze_url(url):
             # Safe Browsing check (critical override)
             safe_browsing_match = google_future.result(timeout=10)
             if safe_browsing_match:
-                risk_score = 100
                 flags.append("Known Phishing Site")
+                risk_score = max(100, risk_score)
 
             # SSL checks only if DNS resolved
             if dns_resolved and not safe_browsing_match:
@@ -254,7 +257,7 @@ def analyze_url(url):
 
         # Final score calculation
         final_score = min(100, risk_score)
-        
+        logging.info(f"Final risk score: {final_score}, Flags: {flags}")
         # High risk threshold
         if final_score >= config['risk_threshold'] and not safe_browsing_match:
             flags.append("High Risk Phishing Suspected")
