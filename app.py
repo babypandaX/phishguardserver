@@ -16,7 +16,7 @@ from urllib3.exceptions import SSLError
 from whois.parser import PywhoisError
 import cryptography.x509
 from cryptography.hazmat.backends import default_backend
-from jellyfish import levenshtein_distance as lev
+from textdistance import levenshtein
 import os
 
 # Load configuration
@@ -66,7 +66,7 @@ def is_typosquatting(domain):
         for brand in brand_keywords:
             if brand in part.lower():
                 return True
-            if lev(part.lower(), brand) <= 2:
+            if levenshtein(part.lower(), brand) <= 2:
                 return True
     
     # Check regex patterns
