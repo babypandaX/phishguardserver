@@ -1,0 +1,30 @@
+{
+  "ecommerce": [
+    "flipkart",
+    "amazon",
+    "myntra",
+    "meesho",
+    "snapdeal",
+    "ajio",
+    "nykaa",
+    "tatacliq"
+  ],
+  "crypto": [
+    "uniswap",
+    "coinbase",
+    "binance",
+    "metamask",
+    "trustwallet",
+    "kraken",
+    "ledger",
+    "phantom"
+  ],
+  "finance": [
+    "paypal",
+    "stripe",
+    "wise",
+    "revolut",
+    "chime",
+    "cashapp"
+  ]
+}
