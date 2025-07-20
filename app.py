@@ -19,9 +19,16 @@ from cryptography.hazmat.backends import default_backend
 from textdistance import levenshtein
 import os
 
-# Load configuration
-with open('config.yaml') as f:
-    config = yaml.safe_load(f)
+# Load configuration from environment variables
+config = {
+    "host": "0.0.0.0",
+    "port": int(os.environ.get("PORT", 5000)),
+    "debug": os.environ.get("DEBUG", "false").lower() == "true",
+    "user_agent": os.environ.get("USER_AGENT", "PhishGuard/2.0"),
+    "google_api_key": os.environ.get("GOOGLE_API_KEY", ""),
+    "risk_threshold": int(os.environ.get("RISK_THRESHOLD", 80)),
+    "log_level": os.environ.get("LOG_LEVEL", "INFO")
+}
 
 # Suppress noisy library logs
 logging.getLogger('urllib3').setLevel(logging.CRITICAL)
