@@ -8,16 +8,15 @@ import socket
 import re
 import logging
 import json
-import yaml
+import os
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from urllib3 import PoolManager
 from urllib3.exceptions import SSLError
 from whois.parser import PywhoisError
 import cryptography.x509
 from cryptography.hazmat.backends import default_backend
 from textdistance import levenshtein
-import os
 
 # Configuration from environment variables
 config = {
@@ -26,7 +25,7 @@ config = {
     "debug": os.environ.get("DEBUG", "false").lower() == "true",
     "user_agent": os.environ.get("USER_AGENT", "PhishGuard/2.0"),
     "google_api_key": os.environ.get("GOOGLE_API_KEY", ""),
-    "risk_threshold": int(os.environ.get("RISK_THRESHOLD", 80)),
+    "risk_threshold": int(os.environ.get("RISK_THRESHOLD", 85)),
     "log_level": os.environ.get("LOG_LEVEL", "INFO")
 }
 
@@ -209,13 +208,13 @@ def analyze_url(url):
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             # DNS resolution check
+            dns_resolved = False
             try:
                 socket.gethostbyname(full_domain)
                 dns_resolved = True
             except socket.gaierror:
-                dns_resolved = False
                 flags.append("DNS Resolution Failed")
-                risk_score += 15  # Reduced from 25
+                risk_score += 5  # Very low penalty
 
             # Concurrent checks
             domain_future = executor.submit(check_domain_age, full_domain)
@@ -224,28 +223,28 @@ def analyze_url(url):
             # Typosquatting detection
             if is_typosquatting(full_domain):
                 flags.append("Typosquatting Patterns Detected")
-                risk_score += 30  # Reduced from 55
+                risk_score += 20  # Reduced penalty
 
             # Domain registration check
             try:
                 domain_data = domain_future.result(timeout=10)
                 if domain_data['exists'] is False:
                     flags.append("Unregistered Domain")
-                    risk_score += 30  # Reduced from 45
+                    risk_score += 20  # Reduced penalty
                 elif domain_data['age'] is not None:
                     if domain_data['age'] < 7:
                         flags.append("Very New Domain (<7 days)")
-                        risk_score += 20  # Reduced from 35
+                        risk_score += 15
                     elif domain_data['age'] < 90:
                         flags.append("New Domain (<90 days)")
-                        risk_score += 15  # Reduced from 25
+                        risk_score += 10
             except TimeoutError:
                 logger.warning("Domain age check timed out")
             
             # Number pattern detection
             if re.search(r'\d{3,}[a-z-]+\d{3,}', full_domain):
                 flags.append("Suspicious Number Pattern")
-                risk_score += 20  # Reduced from 40
+                risk_score += 15
 
             # Safe Browsing check
             try:
@@ -256,15 +255,15 @@ def analyze_url(url):
             except TimeoutError:
                 logger.warning("Safe Browsing check timed out")
 
-            # SSL checks only if DNS resolved
-            if dns_resolved and risk_score < 100:  # Only check if not already confirmed phishing
+            # SSL checks only if DNS resolved and not already confirmed phishing
+            if dns_resolved and risk_score < 100:
                 ssl_future = executor.submit(check_ssl, url)
                 cert_future = executor.submit(get_certificate_info, full_domain)
                 
                 try:
                     ssl_result = ssl_future.result(timeout=6)
                     if not ssl_result['valid']:
-                        risk_score += 15  # Reduced from 30
+                        risk_score += 10
                         flags.append(f"SSL Error: {ssl_result['error_type']}")
                 except TimeoutError:
                     logger.warning("SSL check timed out")
@@ -272,7 +271,7 @@ def analyze_url(url):
                 try:
                     cert_info = cert_future.result(timeout=8)
                     if not cert_info['is_ev'] and not cert_info['organization']:
-                        risk_score += 10  # Reduced from 20
+                        risk_score += 5  # Very low penalty
                         flags.append("Untrusted Certificate")
                 except TimeoutError:
                     logger.warning("Certificate check timed out")
