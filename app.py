@@ -128,7 +128,7 @@ def get_certificate_info(domain):
         return {'valid': False, 'error': str(e)}
 
 def check_domain_age(domain):
-    """Check domain registration details with better error handling"""
+    """Check domain registration details with improved error handling"""
     try:
         info = whois.whois(domain)
         
@@ -152,7 +152,7 @@ def check_domain_age(domain):
             'exists': True
         }
         
-    except (PywhoisError, whois.parser.WhoisCommandFailed):
+    except PywhoisError:
         # Domain doesn't exist in WHOIS
         return {'age': None, 'exists': False}
     except Exception as e:
