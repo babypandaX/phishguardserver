@@ -10,13 +10,14 @@ import logging
 import json
 import os
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from urllib3 import PoolManager
 from urllib3.exceptions import SSLError
 from whois.parser import PywhoisError
 import cryptography.x509
 from cryptography.hazmat.backends import default_backend
 from textdistance import levenshtein
+import dns.resolver
 
 # Configuration from environment variables
 config = {
@@ -25,7 +26,7 @@ config = {
     "debug": os.environ.get("DEBUG", "false").lower() == "true",
     "user_agent": os.environ.get("USER_AGENT", "PhishGuard/2.0"),
     "google_api_key": os.environ.get("GOOGLE_API_KEY", ""),
-    "risk_threshold": int(os.environ.get("RISK_THRESHOLD", 85)),
+    "risk_threshold": int(os.environ.get("RISK_THRESHOLD", 80)),
     "log_level": os.environ.get("LOG_LEVEL", "INFO")
 }
 
@@ -116,44 +117,26 @@ def check_ssl(url):
         return {'valid': False, 'error_type': str(e)}
 
 def get_certificate_info(domain):
-    """Retrieve SSL certificate details"""
+    """Retrieve SSL certificate details - simplified version"""
     try:
         context = ssl.create_default_context()
         with socket.create_connection((domain, 443), timeout=5) as sock:
             with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                cert_bin = ssock.getpeercert(binary_form=True)
-                cert = cryptography.x509.load_der_x509_certificate(cert_bin, default_backend())
-                
-                # Extract organization name
-                org = None
-                try:
-                    org = cert.subject.get_attributes_for_oid(
-                        cryptography.x509.NameOID.ORGANIZATION_NAME
-                    )[0].value
-                except IndexError:
-                    pass
-                
-                # Check Extended Validation
-                is_ev = False
-                try:
-                    ext = cert.extensions.get_extension_for_class(
-                        cryptography.x509.CertificatePolicies
-                    ).value
-                    is_ev = any(policy.policy_identifier in EV_OIDS for policy in ext)
-                except cryptography.x509.ExtensionNotFound:
-                    pass
-                
-                return {'organization': org, 'is_ev': is_ev}
+                # Only check if certificate exists
+                return {'valid': True}
     except Exception as e:
-        return {'organization': None, 'is_ev': False}
+        return {'valid': False, 'error': str(e)}
 
 def check_domain_age(domain):
-    """Check domain registration details"""
+    """Check domain registration details with better error handling"""
     try:
         info = whois.whois(domain)
+        
+        # Check if domain exists
         if not info.domain_name:
             return {'age': None, 'exists': False}
             
+        # Handle creation date
         created = info.creation_date
         if not created:
             return {'age': None, 'exists': True}
@@ -169,14 +152,17 @@ def check_domain_age(domain):
             'exists': True
         }
         
-    except PywhoisError:
+    except (PywhoisError, whois.parser.WhoisCommandFailed):
+        # Domain doesn't exist in WHOIS
         return {'age': None, 'exists': False}
     except Exception as e:
+        logger.error(f"Domain age error for {domain}: {str(e)}")
         return {'age': None, 'exists': None}
 
 def check_safe_browsing(url):
     """Check Google Safe Browsing API"""
     if not config['google_api_key']:
+        logger.warning("Google API key missing - skipping Safe Browsing check")
         return False
         
     try:
@@ -192,13 +178,42 @@ def check_safe_browsing(url):
             },
             timeout=8
         )
-        return bool(response.json().get('matches')) if response.status_code == 200 else False
+        
+        if response.status_code != 200:
+            logger.error(f"Safe Browsing API error: {response.status_code} - {response.text}")
+            return False
+            
+        return bool(response.json().get('matches'))
     except Exception as e:
         logger.error(f"Safe Browsing error: {str(e)}")
         return False
 
+def resolve_dns(domain):
+    """Resolve domain with retries and fallback"""
+    try:
+        # Try A record first
+        answers = dns.resolver.resolve(domain, 'A')
+        if answers:
+            return True
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        pass
+    except dns.resolver.Timeout:
+        logger.warning(f"DNS resolution timeout for {domain}")
+    except Exception as e:
+        logger.warning(f"DNS resolution error for {domain}: {str(e)}")
+    
+    try:
+        # Try CNAME record if A record failed
+        answers = dns.resolver.resolve(domain, 'CNAME')
+        return True
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        return False
+    except Exception as e:
+        logger.warning(f"DNS resolution error for {domain}: {str(e)}")
+        return False
+
 def analyze_url(url):
-    """Main analysis function"""
+    """Main analysis function with improved scoring"""
     try:
         logger.info(f"Analyzing URL: {url}")
         parsed = tldextract.extract(url)
@@ -207,14 +222,11 @@ def analyze_url(url):
         flags = []
 
         with ThreadPoolExecutor(max_workers=4) as executor:
-            # DNS resolution check
-            dns_resolved = False
-            try:
-                socket.gethostbyname(full_domain)
-                dns_resolved = True
-            except socket.gaierror:
+            # DNS resolution check with better handling
+            dns_resolved = resolve_dns(full_domain)
+            if not dns_resolved:
                 flags.append("DNS Resolution Failed")
-                risk_score += 5  # Very low penalty
+                risk_score += 5  # Reduced penalty
 
             # Concurrent checks
             domain_future = executor.submit(check_domain_age, full_domain)
@@ -223,14 +235,14 @@ def analyze_url(url):
             # Typosquatting detection
             if is_typosquatting(full_domain):
                 flags.append("Typosquatting Patterns Detected")
-                risk_score += 20  # Reduced penalty
+                risk_score += 30
 
             # Domain registration check
             try:
                 domain_data = domain_future.result(timeout=10)
                 if domain_data['exists'] is False:
                     flags.append("Unregistered Domain")
-                    risk_score += 20  # Reduced penalty
+                    risk_score += 20
                 elif domain_data['age'] is not None:
                     if domain_data['age'] < 7:
                         flags.append("Very New Domain (<7 days)")
@@ -244,7 +256,7 @@ def analyze_url(url):
             # Number pattern detection
             if re.search(r'\d{3,}[a-z-]+\d{3,}', full_domain):
                 flags.append("Suspicious Number Pattern")
-                risk_score += 15
+                risk_score += 20
 
             # Safe Browsing check
             try:
@@ -255,26 +267,17 @@ def analyze_url(url):
             except TimeoutError:
                 logger.warning("Safe Browsing check timed out")
 
-            # SSL checks only if DNS resolved and not already confirmed phishing
+            # SSL checks only if DNS resolved and not already high risk
             if dns_resolved and risk_score < 100:
                 ssl_future = executor.submit(check_ssl, url)
-                cert_future = executor.submit(get_certificate_info, full_domain)
                 
                 try:
                     ssl_result = ssl_future.result(timeout=6)
                     if not ssl_result['valid']:
                         risk_score += 10
-                        flags.append(f"SSL Error: {ssl_result['error_type']}")
+                        flags.append(f"SSL Error: {ssl_result.get('error_type', 'Unknown')}")
                 except TimeoutError:
                     logger.warning("SSL check timed out")
-
-                try:
-                    cert_info = cert_future.result(timeout=8)
-                    if not cert_info['is_ev'] and not cert_info['organization']:
-                        risk_score += 5  # Very low penalty
-                        flags.append("Untrusted Certificate")
-                except TimeoutError:
-                    logger.warning("Certificate check timed out")
 
         # Final score calculation
         final_score = min(100, risk_score)
@@ -291,10 +294,10 @@ def analyze_url(url):
         }
 
     except Exception as e:
-        logger.error(f"Analysis error: {str(e)}")
+        logger.error(f"Analysis error: {str(e)}", exc_info=True)
         return {
-            "risk_score": 100,
-            "flags": ["Security verification failed"],
+            "risk_score": 0,  # Return 0 instead of 100 to avoid false positives
+            "flags": ["Temporary analysis failure"],
             "analyzed_url": url
         }
 
@@ -312,7 +315,7 @@ def check_url():
         return jsonify(analyze_url(data['url']))
         
     except Exception as e:
-        logger.error(f"Endpoint error: {str(e)}")
+        logger.error(f"Endpoint error: {str(e)}", exc_info=True)
         return jsonify({"error": "Server processing error"}), 500
 
 if __name__ == '__main__':
