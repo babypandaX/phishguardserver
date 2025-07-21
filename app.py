@@ -19,28 +19,36 @@ from cryptography.hazmat.backends import default_backend
 from textdistance import levenshtein
 import os
 
-# Load configuration from environment variables
+# Configuration from environment variables
 config = {
     "host": "0.0.0.0",
     "port": int(os.environ.get("PORT", 5000)),
     "debug": os.environ.get("DEBUG", "false").lower() == "true",
     "user_agent": os.environ.get("USER_AGENT", "PhishGuard/2.0"),
-    "google_api_key": os.environ.get("AIzaSyA5nF2eOEhYvY-GCnHuk4jjPv1LcrwC3J8", ""),
+    "google_api_key": os.environ.get("GOOGLE_API_KEY", ""),
     "risk_threshold": int(os.environ.get("RISK_THRESHOLD", 80)),
     "log_level": os.environ.get("LOG_LEVEL", "INFO")
 }
 
+# Set up logging
+logging.basicConfig(level=config["log_level"])
+logger = logging.getLogger(__name__)
+
 # Suppress noisy library logs
 logging.getLogger('urllib3').setLevel(logging.CRITICAL)
+logging.getLogger('tldextract').setLevel(logging.CRITICAL)
 
 app = Flask(__name__)
 CORS(app, resources={r"/check": {"origins": "*"}})
-executor = ThreadPoolExecutor(max_workers=8)
 
 # Load brand database
-with open('brands.json') as f:
-    brand_db = json.load(f)
-    brand_keywords = sum(brand_db.values(), [])
+try:
+    with open('brands.json') as f:
+        brand_db = json.load(f)
+        brand_keywords = sum(brand_db.values(), [])
+except Exception as e:
+    logger.error(f"Error loading brands database: {str(e)}")
+    brand_keywords = []
 
 EV_OIDS = [
     cryptography.x509.ObjectIdentifier("2.23.140.1.1"),
@@ -104,7 +112,6 @@ def check_ssl(url):
             allow_redirects=True,
             stream=False
         )
-        logging.info(f"SSL Valid: {ssl_result['valid']}, Error: {ssl_result.get('error_type')}")
         return {'valid': True, 'error_type': None}
     except Exception as e:
         return {'valid': False, 'error_type': str(e)}
@@ -136,7 +143,7 @@ def get_certificate_info(domain):
                     is_ev = any(policy.policy_identifier in EV_OIDS for policy in ext)
                 except cryptography.x509.ExtensionNotFound:
                     pass
-               
+                
                 return {'organization': org, 'is_ev': is_ev}
     except Exception as e:
         return {'organization': None, 'is_ev': False}
@@ -157,7 +164,7 @@ def check_domain_age(domain):
             
         if not isinstance(created, datetime):
             return {'age': None, 'exists': True}
-        logging.info(f"Domain age: {domain_data['age']} days, Exists: {domain_data['exists']}")   
+            
         return {
             'age': (datetime.now() - created).days,
             'exists': True
@@ -170,6 +177,9 @@ def check_domain_age(domain):
 
 def check_safe_browsing(url):
     """Check Google Safe Browsing API"""
+    if not config['google_api_key']:
+        return False
+        
     try:
         response = requests.post(
             "https://safebrowsing.googleapis.com/v4/threatMatches:find",
@@ -183,15 +193,15 @@ def check_safe_browsing(url):
             },
             timeout=8
         )
-        logging.info(f"Safe Browsing Match: {safe_browsing_match}")
         return bool(response.json().get('matches')) if response.status_code == 200 else False
     except Exception as e:
+        logger.error(f"Safe Browsing error: {str(e)}")
         return False
 
 def analyze_url(url):
     """Main analysis function"""
     try:
-        logging.info(f"Analyzing URL: {url}")
+        logger.info(f"Analyzing URL: {url}")
         parsed = tldextract.extract(url)
         full_domain = f"{parsed.domain}.{parsed.suffix}"
         risk_score = 0
@@ -205,7 +215,7 @@ def analyze_url(url):
             except socket.gaierror:
                 dns_resolved = False
                 flags.append("DNS Resolution Failed")
-                risk_score += 25
+                risk_score += 15  # Reduced from 25
 
             # Concurrent checks
             domain_future = executor.submit(check_domain_age, full_domain)
@@ -214,54 +224,67 @@ def analyze_url(url):
             # Typosquatting detection
             if is_typosquatting(full_domain):
                 flags.append("Typosquatting Patterns Detected")
-                risk_score += 55
+                risk_score += 30  # Reduced from 55
 
             # Domain registration check
-            domain_data = domain_future.result(timeout=10)
-            if domain_data['exists'] is False:
-                flags.append("Unregistered Domain")
-                risk_score += 45
-            elif domain_data['age'] is not None:
-                if domain_data['age'] < 7:
-                    flags.append("Very New Domain (<7 days)")
-                    risk_score += 35
-                elif domain_data['age'] < 90:
-                    flags.append("New Domain (<90 days)")
-                    risk_score += 25
+            try:
+                domain_data = domain_future.result(timeout=10)
+                if domain_data['exists'] is False:
+                    flags.append("Unregistered Domain")
+                    risk_score += 30  # Reduced from 45
+                elif domain_data['age'] is not None:
+                    if domain_data['age'] < 7:
+                        flags.append("Very New Domain (<7 days)")
+                        risk_score += 20  # Reduced from 35
+                    elif domain_data['age'] < 90:
+                        flags.append("New Domain (<90 days)")
+                        risk_score += 15  # Reduced from 25
+            except TimeoutError:
+                logger.warning("Domain age check timed out")
             
             # Number pattern detection
             if re.search(r'\d{3,}[a-z-]+\d{3,}', full_domain):
                 flags.append("Suspicious Number Pattern")
-                risk_score += 40
+                risk_score += 20  # Reduced from 40
 
-            # Safe Browsing check (critical override)
-            safe_browsing_match = google_future.result(timeout=10)
-            if safe_browsing_match:
-                flags.append("Known Phishing Site")
-                risk_score = max(100, risk_score)
+            # Safe Browsing check
+            try:
+                safe_browsing_match = google_future.result(timeout=10)
+                if safe_browsing_match:
+                    flags.append("Known Phishing Site")
+                    risk_score = 100  # Override only if confirmed
+            except TimeoutError:
+                logger.warning("Safe Browsing check timed out")
 
             # SSL checks only if DNS resolved
-            if dns_resolved and not safe_browsing_match:
+            if dns_resolved and risk_score < 100:  # Only check if not already confirmed phishing
                 ssl_future = executor.submit(check_ssl, url)
                 cert_future = executor.submit(get_certificate_info, full_domain)
                 
-                ssl_result = ssl_future.result(timeout=6)
-                if not ssl_result['valid']:
-                    risk_score += 30
-                    flags.append(f"SSL Error: {ssl_result['error_type']}")
+                try:
+                    ssl_result = ssl_future.result(timeout=6)
+                    if not ssl_result['valid']:
+                        risk_score += 15  # Reduced from 30
+                        flags.append(f"SSL Error: {ssl_result['error_type']}")
+                except TimeoutError:
+                    logger.warning("SSL check timed out")
 
-                cert_info = cert_future.result(timeout=8)
-                if not cert_info['is_ev'] and not cert_info['organization']:
-                    risk_score += 20
-                    flags.append("Untrusted Certificate")
+                try:
+                    cert_info = cert_future.result(timeout=8)
+                    if not cert_info['is_ev'] and not cert_info['organization']:
+                        risk_score += 10  # Reduced from 20
+                        flags.append("Untrusted Certificate")
+                except TimeoutError:
+                    logger.warning("Certificate check timed out")
 
         # Final score calculation
         final_score = min(100, risk_score)
-        logging.info(f"Final risk score: {final_score}, Flags: {flags}")
+        
         # High risk threshold
-        if final_score >= config['risk_threshold'] and not safe_browsing_match:
+        if final_score >= config['risk_threshold'] and not any("Known Phishing Site" in flag for flag in flags):
             flags.append("High Risk Phishing Suspected")
-
+            
+        logger.info(f"Final risk score: {final_score}, Flags: {flags}")
         return {
             "risk_score": final_score,
             "flags": [f for f in flags if f],
@@ -269,7 +292,7 @@ def analyze_url(url):
         }
 
     except Exception as e:
-        logging.error(f"Analysis error: {str(e)}")
+        logger.error(f"Analysis error: {str(e)}")
         return {
             "risk_score": 100,
             "flags": ["Security verification failed"],
@@ -290,9 +313,13 @@ def check_url():
         return jsonify(analyze_url(data['url']))
         
     except Exception as e:
-        logging.error(f"Endpoint error: {str(e)}")
+        logger.error(f"Endpoint error: {str(e)}")
         return jsonify({"error": "Server processing error"}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(
+        host=config['host'],
+        port=config['port'],
+        threaded=True,
+        debug=config['debug']
+    )
